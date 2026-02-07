@@ -25,6 +25,7 @@ set(PT_DIR     "${CMAKE_CURRENT_LIST_DIR}/lib/pt")
 add_executable(pico_wheel_control
     main.c
     
+<<<<<<< HEAD
     # Wiznet Core
     ${WIZNET_DIR}/Ethernet/wizchip_conf.c
     ${WIZNET_DIR}/Ethernet/socket.c
@@ -34,6 +35,8 @@ add_executable(pico_wheel_control
     ${PORT_DIR}/ioLibrary_Driver/src/w5x00_spi.c
     ${PORT_DIR}/timer/timer.c
     
+=======
+>>>>>>> e183a6a256fc127aa7b341b48428abda968313af
     # RoboClaw Bridge (C++)
     ${ROBOCLAW_DIR}/Basicmicro.cpp
     ${ROBOCLAW_DIR}/roboclaw_bridge.cpp
@@ -45,6 +48,7 @@ add_executable(pico_wheel_control
 target_include_directories(pico_wheel_control PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}
     
+<<<<<<< HEAD
     # Wiznet
     ${WIZNET_DIR}/Ethernet
     ${WIZNET_DIR}/Ethernet/W5500
@@ -58,6 +62,13 @@ target_include_directories(pico_wheel_control PRIVATE
     
     # Protothreads
     ${PT_DIR}
+=======
+    # RoboClaw Includes
+    lib/Basicmicro
+    
+    # Protothreads Includes (Header only)
+    lib/pt
+>>>>>>> e183a6a256fc127aa7b341b48428abda968313af
 )
 
 # --------------------------------------------------------------------
@@ -65,6 +76,7 @@ target_include_directories(pico_wheel_control PRIVATE
 # --------------------------------------------------------------------
 target_link_libraries(pico_wheel_control PRIVATE
     pico_stdlib
+<<<<<<< HEAD
     hardware_spi
     hardware_dma
     hardware_uart
@@ -77,4 +89,16 @@ target_link_libraries(pico_wheel_control PRIVATE
 # --------------------------------------------------------------------
 pico_enable_stdio_usb(pico_wheel_control 1)
 pico_enable_stdio_uart(pico_wheel_control 0)
+=======
+    hardware_uart
+)
+
+# --- Standard IO Configuration ---
+# Enable USB output for debug printf (Crucial for typing angles)
+pico_enable_stdio_usb(pico_wheel_control 1)
+# Disable UART stdio (UART1 is used for RoboClaw)
+pico_enable_stdio_uart(pico_wheel_control 0)
+
+# --- Output Generation ---
+>>>>>>> e183a6a256fc127aa7b341b48428abda968313af
 pico_add_extra_outputs(pico_wheel_control)
