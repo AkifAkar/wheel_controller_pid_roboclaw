@@ -1,152 +1,160 @@
 #include <stdio.h>
-#include <string.h>
 #include <stdlib.h>
 #include "pico/stdlib.h"
-#include "hardware/spi.h"
 #include "hardware/uart.h"
-
-/* --- Library Includes --- */
-// WIZnet dependencies (Ensure these are in your CMake path)
-#include "port_common.h"
-#include "wizchip_conf.h"
-#include "w5x00_spi.h"
-#include "socket.h"
-
-// RoboClaw dependencies
+#include "hardware/gpio.h"
+#include "pt.h"
 #include "roboclaw_bridge.h"
 
-/**
- * ----------------------------------------------------------------------------------------------------
- * Configuration & Definitions
- * ----------------------------------------------------------------------------------------------------
- */
-
-/* System Clock */
-#define PLL_SYS_KHZ (133 * 1000)
-
-/* Network Configuration */
-#define SOCKET_UDP        0
-#define PORT_UDP          5000 
-#define ETHERNET_BUF_SIZE 2048
-
-// Static IP Configuration (10.42.0.32)
-#define MY_IP_OCTET_1 10
-#define MY_IP_OCTET_2 42
-#define MY_IP_OCTET_3 0
-#define MY_IP_OCTET_4 32
-
-/* RoboClaw Configuration */
+// --- Configuration ---
 #define ROBOCLAW_UART_ID  uart1
 #define ROBOCLAW_TX_PIN   8
 #define ROBOCLAW_RX_PIN   9
-#define ROBOCLAW_BAUD     38400 // Standard RoboClaw baud (adjust if your generic setup differs)
+#define ROBOCLAW_BAUD     2400   
 #define ROBOCLAW_ADDR     0x80
-#define ROBOCLAW_TIMEOUT  10000
+#define ROBOCLAW_TIMEOUT  100000 
 
-/* Global Objects */
-static wiz_NetInfo g_net_info = {
-    .mac = {0x00, 0x08, 0xDC, 0x12, 0x34, 0x32},
-    .ip = {MY_IP_OCTET_1, MY_IP_OCTET_2, MY_IP_OCTET_3, MY_IP_OCTET_4},
-    .sn = {255, 255, 255, 0},
-    .gw = {10, 42, 0, 254},
-    .dns = {8, 8, 8, 8},
-    .dhcp = NETINFO_STATIC
-};
+// --- Motor Constants ---
+#define M1_ACCEL          0   // Lowered for smoother ramp
+#define M1_SPEED          550   
+#define M1_DECCEL         0   // Lowered for smoother stop
+#define M1_BUFFER_FLAG    0     // 0 = Buffer (Smoother transitions)
 
-static uint8_t g_udp_buf[ETHERNET_BUF_SIZE] = {0,};
+// --- Encoder Logic ---
+#define ENC_MIN 278
+#define ENC_MAX 1700
+#define ANGLE_MIN 90
+#define ANGLE_MAX 270
+
+// --- Globals ---
+volatile int32_t g_desired_encoder_val = ENC_MIN;
+volatile int32_t g_current_encoder_val = 0; 
 Roboclaw_Handle* g_roboclaw = NULL;
 
-/**
- * ----------------------------------------------------------------------------------------------------
- * Helper Functions
- * ----------------------------------------------------------------------------------------------------
- */
+// --- Threads ---
+static struct pt pt_send;
+static struct pt pt_read;
 
-// Initialize the 133MHz System Clock
-static void set_clock_khz(void) {
-    set_sys_clock_khz(PLL_SYS_KHZ, true);
-    clock_configure(clk_peri, 0, CLOCKS_CLK_PERI_CTRL_AUXSRC_VALUE_CLKSRC_PLL_SYS, 
-                    PLL_SYS_KHZ * 1000, PLL_SYS_KHZ * 1000);
+// --- Helper ---
+void update_encoder_target(int angle_input) {
+    if (angle_input < ANGLE_MIN) angle_input = ANGLE_MIN;
+    if (angle_input > ANGLE_MAX) angle_input = ANGLE_MAX;
+    int32_t possible_movement = ENC_MAX - ENC_MIN;
+    int32_t angle_range = ANGLE_MAX - ANGLE_MIN;
+    g_desired_encoder_val = ENC_MIN + ((angle_input - ANGLE_MIN) * possible_movement) / angle_range;
 }
 
-// Master Hardware Initialization
-void system_init(void) {
-    /* 1. Basic System & Debug IO */
-    set_clock_khz();
+// ----------------------------------------------------------
+// PROTOTHREAD 1: Send Target (SMART VERSION)
+// ----------------------------------------------------------
+static int thread_roboclaw_send(struct pt *pt) {
+    static uint32_t timestamp;
+    static int32_t last_sent_target = -1; // Force send on first run
+
+    PT_BEGIN(pt);
+
+    while(1) {
+        // ONLY send if the target has changed!
+        // This prevents "stuttering" from re-sending the same command repeatedly.
+        if (g_roboclaw && (g_desired_encoder_val != last_sent_target)) {
+            
+            roboclaw_speed_accel_deccel_pos_m1(
+                g_roboclaw, ROBOCLAW_ADDR, 
+                M1_ACCEL, M1_SPEED, M1_DECCEL, 
+                g_desired_encoder_val, M1_BUFFER_FLAG
+            );
+            
+            // Update our tracker so we don't send again until user asks
+            last_sent_target = g_desired_encoder_val;
+            printf("Command Sent: Go to %d\n", last_sent_target);
+        }
+
+        // Wait 100ms (Fast checks are fine now because we rarely transmit)
+        timestamp = to_ms_since_boot(get_absolute_time());
+        PT_WAIT_UNTIL(pt, to_ms_since_boot(get_absolute_time()) - timestamp >= 100);
+    }
+
+    PT_END(pt);
+}
+
+// ----------------------------------------------------------
+// PROTOTHREAD 2: Read Status (1Hz)
+// ----------------------------------------------------------
+static int thread_roboclaw_read(struct pt *pt) {
+    static uint32_t timestamp;
+    static uint16_t voltage;
+    static bool valid_v;
+    static uint32_t raw_enc;
+    static uint8_t status_m1;
+    static bool valid_enc;
+
+    PT_BEGIN(pt);
+
+    while(1) {
+        if (g_roboclaw) {
+            voltage = roboclaw_read_main_battery(g_roboclaw, ROBOCLAW_ADDR, &valid_v);
+            PT_YIELD(pt); // Yield to keep things fluid
+            raw_enc = roboclaw_read_enc_m1(g_roboclaw, ROBOCLAW_ADDR, &status_m1, &valid_enc);
+
+            if (valid_enc) g_current_encoder_val = (int32_t)raw_enc;
+
+            // Optional: Comment this out if it spams your console too much
+            printf("\n[Status] V: %d.%d | Pos: %d\n", voltage/10, voltage%10, g_current_encoder_val);
+        }
+
+        timestamp = to_ms_since_boot(get_absolute_time());
+        PT_WAIT_UNTIL(pt, to_ms_since_boot(get_absolute_time()) - timestamp >= 1000);
+    }
+
+    PT_END(pt);
+}
+
+// ----------------------------------------------------------
+// MAIN
+// ----------------------------------------------------------
+void setup() {
     stdio_init_all();
-    sleep_ms(2000); // Wait for serial to settle
-    printf("--- System Booting ---\n");
+    sleep_ms(2000);
+    printf("--- Smart Motion Mode ---\n");
 
-    /* 2. Initialize Wiznet W5500 (SPI0) */
-    // Note: SPI pins (RX, TX, SCK, CS) are defined in your port_common.h 
-    // or CMakeLists.txt. Ensure they match your hardware (e.g., GP16/17/18/19 or similar).
-    printf("Initializing W5500 Ethernet...\n");
-    wizchip_spi_initialize();
-    wizchip_cris_initialize();
-    
-    wizchip_reset();
-    wizchip_initialize();
-    wizchip_check();
-    
-    network_initialize(g_net_info);
-    print_network_information(g_net_info);
+    gpio_set_function(ROBOCLAW_TX_PIN, GPIO_FUNC_UART);
+    gpio_set_function(ROBOCLAW_RX_PIN, GPIO_FUNC_UART);
 
-    /* 3. Initialize RoboClaw (UART1 on GP8/GP9) */
-    printf("Initializing RoboClaw on UART1...\n");
-    // We create the handle here to be used later by the threads
     g_roboclaw = roboclaw_create(ROBOCLAW_UART_ID, ROBOCLAW_TX_PIN, ROBOCLAW_RX_PIN, ROBOCLAW_TIMEOUT);
     if (g_roboclaw) {
         roboclaw_begin(g_roboclaw, ROBOCLAW_BAUD);
-        printf("RoboClaw Initialized.\n");
-    } else {
-        printf("FAILED to create RoboClaw handle.\n");
     }
+
+    PT_INIT(&pt_send);
+    PT_INIT(&pt_read);
+    
+    printf("Enter Angle (90-270): \n");
 }
 
-/**
- * ----------------------------------------------------------------------------------------------------
- * Main
- * ----------------------------------------------------------------------------------------------------
- */
 int main() {
-    int32_t ret = 0;
-    uint8_t remote_ip[4] = {0};
-    uint16_t remote_port = 0;
+    setup();
 
-    // Run setup
-    system_init();
+    while (true) {
+        thread_roboclaw_send(&pt_send);
+        thread_roboclaw_read(&pt_read);
 
-    // Open UDP Socket
-    if((ret = socket(SOCKET_UDP, Sn_MR_UDP, PORT_UDP, 0)) != SOCKET_UDP) {
-        printf("Socket creation failed. Error: %ld\n", ret);
-        while(1) tight_loop_contents();
-    } else {
-        printf("UDP Socket %d opened on Port %d.\n", SOCKET_UDP, PORT_UDP);
-    }
-
-    printf("Ready to receive JSON data...\n");
-
-    // Main Loop (Test Only: Receive & Print)
-    while (1) {
-        // Check for incoming data size
-        uint16_t size = getSn_RX_RSR(SOCKET_UDP);
-
-        if (size > 0) {
-            // Read data into buffer
-            int32_t recv_len = recvfrom(SOCKET_UDP, g_udp_buf, ETHERNET_BUF_SIZE - 1, remote_ip, &remote_port);
-
-            if (recv_len > 0) {
-                // Null-terminate string for printing
-                g_udp_buf[recv_len] = '\0';
-                
-                printf("\n[UDP RX] From %d.%d.%d.%d:%d\n", 
-                       remote_ip[0], remote_ip[1], remote_ip[2], remote_ip[3], remote_port);
-                printf("Payload: %s\n", g_udp_buf);
+        // Input Handling
+        int input_char = getchar_timeout_us(0); 
+        static char buffer[10];
+        static int buf_idx = 0;
+        
+        if (input_char != PICO_ERROR_TIMEOUT) {
+            if (input_char == '\n' || input_char == '\r') {
+                buffer[buf_idx] = 0; 
+                int angle = atoi(buffer);
+                if (angle > 0) { 
+                    update_encoder_target(angle);
+                    // printf handled in the thread now
+                }
+                buf_idx = 0; 
+            } else if (buf_idx < 9 && input_char >= '0' && input_char <= '9') {
+                buffer[buf_idx++] = (char)input_char;
             }
         }
-        
-        // Minimal delay to prevent locking the core completely
-        // In the next step, protothreads will manage this timing.
-        sleep_ms(1); 
     }
 }
