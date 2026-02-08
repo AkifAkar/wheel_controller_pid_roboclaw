@@ -1,7 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <math.h> // For abs()
+#include <math.h> 
 #include "pico/stdlib.h"
 #include "hardware/uart.h"
 #include "hardware/spi.h"
@@ -21,10 +21,18 @@
 #define PORT_UDP          5000 
 #define ETHERNET_BUF_SIZE 2048
 
+#ifndef LAST_IP_OCTET
+    #define LAST_IP_OCTET 32
+#endif
+
+#ifndef MAC_LAST_BYTE
+    #define MAC_LAST_BYTE 0x32
+#endif
+
 // IP: 10.42.0.32
 static wiz_NetInfo g_net_info = {
-    .mac = {0x00, 0x08, 0xDC, 0x12, 0x34, 0x32},
-    .ip = {10, 42, 0, 32},
+    .mac = {0x00, 0x08, 0xDC, 0x12, 0x34, MAC_LAST_BYTE},
+    .ip = {10, 42, 0, LAST_IP_OCTET},
     .sn = {255, 255, 255, 0},
     .gw = {10, 42, 0, 254},
     .dns = {8, 8, 8, 8},
@@ -49,19 +57,28 @@ static bool g_has_connection = false;
 #define ROBOCLAW_TIMEOUT  100000 
 
 // --- Motor Constants ---
-#define M1_ACCEL          2000  // Snappy
+#define M1_ACCEL          2000  
 #define M1_SPEED          550   
 #define M1_DECCEL         2000  
-#define M1_BUFFER_FLAG    1     // Instant
+#define M1_BUFFER_FLAG    1     
 
 // --- Encoder Logic ---
-#define ENC_MIN 250
-#define ENC_MAX 1700
+#ifndef ENC_MIN
+    #define ENC_MIN 250
+#endif
+#ifndef ENC_MAX
+    #define ENC_MAX 1700
+#endif
 #define ANGLE_MIN 90
 #define ANGLE_MAX 270
 
+// --- If the logic is inverted ---
+#ifndef INVERTED
+    #define INVERTED 1
+#endif
+
 // --- Globals ---
-volatile int32_t g_desired_encoder_val = ENC_MIN; // Motor 1 Target
+volatile int32_t g_desired_encoder_val = 1050; // Motor 1 Target
 volatile int32_t g_desired_speed_val = 0;         // Motor 2 Speed (-127 to 127)
 volatile int32_t g_current_encoder_val = 0; 
 volatile uint16_t g_battery_voltage = 0;
@@ -69,7 +86,8 @@ Roboclaw_Handle* g_roboclaw = NULL;
 
 // --- Threads ---
 static struct pt pt_motor_send;
-static struct pt pt_motor_read;
+static struct pt pt_read_encoders;
+static struct pt pt_read_battery;
 static struct pt pt_udp_rx;
 static struct pt pt_udp_tx;
 
@@ -83,9 +101,12 @@ static void set_clock_khz(void) {
 void update_encoder_target(int angle_input) {
     if (angle_input < ANGLE_MIN) angle_input = ANGLE_MIN;
     if (angle_input > ANGLE_MAX) angle_input = ANGLE_MAX;
+    if (INVERTED) angle_input = 360 - angle_input;
+    
     int32_t possible_movement = ENC_MAX - ENC_MIN;
     int32_t angle_range = ANGLE_MAX - ANGLE_MIN;
     g_desired_encoder_val = ENC_MIN + ((angle_input - ANGLE_MIN) * possible_movement) / angle_range;
+    
 }
 
 void update_speed_target(int speed_input) {
@@ -136,8 +157,8 @@ static int thread_motor_send(struct pt *pt) {
     static uint32_t last_tx_time_m2 = 0;
     
     // State Trackers
-    static int32_t last_sent_target_m1 = -1; 
-    static int32_t last_sent_speed_m2 = -999; 
+    static int32_t last_sent_target_m1 = (ENC_MIN+ENC_MAX)/2; 
+    static int32_t last_sent_speed_m2 = 0; 
 
     // Baud Rate Limiter (2400 baud = ~105ms per packet)
     // We prevent sending faster than this to avoid blocking the CPU
@@ -203,24 +224,42 @@ static int thread_motor_send(struct pt *pt) {
 }
 
 // ----------------------------------------------------------
-// THREAD: Motor Read (Status)
+// THREAD: Read Encoders (Fast - 50ms)
 // ----------------------------------------------------------
-static int thread_motor_read(struct pt *pt) {
+static int thread_read_encoders(struct pt *pt) {
     static uint32_t timestamp;
-    static bool valid_v, valid_enc;
+    static bool valid_enc;
     static uint32_t raw_enc;
     static uint8_t status_m1;
 
     PT_BEGIN(pt);
     while(1) {
         if (g_roboclaw) {
-            g_battery_voltage = roboclaw_read_main_battery(g_roboclaw, ROBOCLAW_ADDR, &valid_v);
-            PT_YIELD(pt); 
             raw_enc = roboclaw_read_enc_m1(g_roboclaw, ROBOCLAW_ADDR, &status_m1, &valid_enc);
             if (valid_enc) g_current_encoder_val = (int32_t)raw_enc;
         }
         timestamp = to_ms_since_boot(get_absolute_time());
-        PT_WAIT_UNTIL(pt, to_ms_since_boot(get_absolute_time()) - timestamp >= 10000);
+        // Read frequently for responsive feedback
+        PT_WAIT_UNTIL(pt, to_ms_since_boot(get_absolute_time()) - timestamp >= 50);
+    }
+    PT_END(pt);
+}
+
+// ----------------------------------------------------------
+// THREAD: Read Battery (Slow - 60s)
+// ----------------------------------------------------------
+static int thread_read_battery(struct pt *pt) {
+    static uint32_t timestamp;
+    static bool valid_v;
+
+    PT_BEGIN(pt);
+    while(1) {
+        if (g_roboclaw) {
+            g_battery_voltage = roboclaw_read_main_battery(g_roboclaw, ROBOCLAW_ADDR, &valid_v);
+        }
+        timestamp = to_ms_since_boot(get_absolute_time());
+        // Read rarely to save bus bandwidth
+        PT_WAIT_UNTIL(pt, to_ms_since_boot(get_absolute_time()) - timestamp >= 60000);
     }
     PT_END(pt);
 }
@@ -322,7 +361,8 @@ void setup() {
     if (g_roboclaw) roboclaw_begin(g_roboclaw, ROBOCLAW_BAUD);
 
     PT_INIT(&pt_motor_send);
-    PT_INIT(&pt_motor_read);
+    PT_INIT(&pt_read_encoders);
+    PT_INIT(&pt_read_battery);
     PT_INIT(&pt_udp_rx);
     PT_INIT(&pt_udp_tx);
 }
@@ -331,7 +371,8 @@ int main() {
     setup();
     while (true) {
         thread_motor_send(&pt_motor_send);
-        thread_motor_read(&pt_motor_read);
+        thread_read_encoders(&pt_read_encoders);
+        thread_read_battery(&pt_read_battery);
         thread_udp_rx(&pt_udp_rx);
         thread_udp_tx(&pt_udp_tx);
     }
