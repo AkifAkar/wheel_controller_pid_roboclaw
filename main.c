@@ -78,7 +78,7 @@ static bool g_has_connection = false;
 #endif
 
 // --- Globals ---
-volatile int32_t g_desired_encoder_val = 1050; // Motor 1 Target
+volatile int32_t g_desired_encoder_val = 1050;    // Motor 1 Target
 volatile int32_t g_desired_speed_val = 0;         // Motor 2 Speed (-127 to 127)
 volatile int32_t g_current_encoder_val = 0; 
 volatile uint16_t g_battery_voltage = 0;
