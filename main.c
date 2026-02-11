@@ -202,7 +202,7 @@ static int thread_motor_send(struct pt *pt) {
                 if (now - last_tx_time_m1 > 20) { 
                     printf("[M2] Speed: %d\n", g_desired_speed_val);
                     
-                    uint8_t speed_mag = (uint8_t)abs(g_desired_speed_val);
+                    uint8_t speed_mag = (uint8_t)abs(g_desired_speed_val)*2;
                     if (g_desired_speed_val >= 0) {
                         roboclaw_forward_m2(g_roboclaw, ROBOCLAW_ADDR, speed_mag);
                     } else {
@@ -348,7 +348,9 @@ void setup() {
     wizchip_initialize();
     wizchip_check();
     network_initialize(g_net_info);
-    
+    gpio_init(25);
+    gpio_set_dir(25, GPIO_OUT);
+
     if(socket(SOCKET_UDP, Sn_MR_UDP, PORT_UDP, 0) != SOCKET_UDP) {
         printf("Socket Fail!\n");
         while(1);
