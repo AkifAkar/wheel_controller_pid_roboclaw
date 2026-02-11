@@ -57,9 +57,9 @@ static bool g_has_connection = false;
 #define ROBOCLAW_TIMEOUT  100000 
 
 // --- Motor Constants ---
-#define M1_ACCEL          2000  
+#define M1_ACCEL          5000  
 #define M1_SPEED          550   
-#define M1_DECCEL         2000  
+#define M1_DECCEL         5000  
 #define M1_BUFFER_FLAG    1     
 
 // --- Encoder Logic ---
