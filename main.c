@@ -29,7 +29,7 @@
     #define MAC_LAST_BYTE 0x32
 #endif
 
-// IP: 10.42.0.32
+// IP
 static wiz_NetInfo g_net_info = {
     .mac = {0x00, 0x08, 0xDC, 0x12, 0x34, MAC_LAST_BYTE},
     .ip = {10, 42, 0, LAST_IP_OCTET},
@@ -141,10 +141,10 @@ void parse_and_process_json(char* json_str) {
         }
     }
     
-    // 3. Parse LIGHT (Optional, just demonstrating parsing)
+    
     char* key_light = strstr(json_str, "\"light\"");
     if (key_light) {
-        // Can add logic here later
+        // Not included yet
     }
 }
 
@@ -172,7 +172,6 @@ static int thread_motor_send(struct pt *pt) {
         if (g_roboclaw) {
             
             // --- Motor 1: Steering (Priority) ---
-            // If Target Changed AND Cooldown Passed
             if ((g_desired_encoder_val != last_sent_target_m1) && 
                 (now - last_tx_time_m1 >= MIN_TX_INTERVAL)) {
                 
@@ -185,9 +184,9 @@ static int thread_motor_send(struct pt *pt) {
                 );
                 
                 last_sent_target_m1 = g_desired_encoder_val;
-                last_tx_time_m1 = now; // Reset Cooldown
+                last_tx_time_m1 = now; 
                 
-                // Yield to let other threads run while UART hardware works
+                
                 PT_YIELD(pt); 
             }
 
@@ -214,10 +213,6 @@ static int thread_motor_send(struct pt *pt) {
                 }
             }
         }
-
-        // CRITICAL CHANGE: 
-        // Instead of waiting 100ms unconditionally, we just YIELD.
-        // This allows the thread to check for new UDP packets immediately.
         PT_YIELD(pt);
     }
     PT_END(pt);
@@ -271,38 +266,30 @@ static int thread_udp_rx(struct pt *pt) {
     static int32_t recv_len;
     static uint8_t remote_ip[4];
     static uint16_t remote_port;
-    
-    // Safety: Don't get stuck in this loop forever if flooded
-    static int burst_count; 
+    static bool has_new_command;
 
     PT_BEGIN(pt);
     while(1) {
-        // Reset burst counter
-        burst_count = 0;
+        has_new_command = false;
 
-        // BURST LOOP: Keep reading as long as data is waiting!
-        // We process up to 10 packets in a row before yielding.
-        // This ensures we always process the LATEST command if multiple arrive.
-        while (getSn_RX_RSR(SOCKET_UDP) > 0 && burst_count < 10) {
-            
+        // Drain the buffer entirely. Only keep the latest packet.
+        while (getSn_RX_RSR(SOCKET_UDP) > 0) {
             recv_len = recvfrom(SOCKET_UDP, g_rx_buf, ETHERNET_BUF_SIZE - 1, remote_ip, &remote_port);
-
             if (recv_len > 0) {
-                g_rx_buf[recv_len] = '\0';
-                
+                has_new_command = true;
                 // Update connection info
                 memcpy(g_dest_ip, remote_ip, 4);
                 g_dest_port = remote_port;
                 g_has_connection = true;
-
-                // Parse immediately
-                parse_and_process_json((char*)g_rx_buf);
             }
-            
-            burst_count++;
+        }
+
+        // Only parse the absolute freshest packet
+        if (has_new_command) {
+            g_rx_buf[recv_len] = '\0';
+            parse_and_process_json((char*)g_rx_buf);
         }
         
-        // Only yield after we have cleared the buffer or hit the limit
         PT_YIELD(pt);
     }
     PT_END(pt);
@@ -372,6 +359,7 @@ void setup() {
 int main() {
     setup();
     while (true) {
+        // initialize threads
         thread_motor_send(&pt_motor_send);
         thread_read_encoders(&pt_read_encoders);
         thread_read_battery(&pt_read_battery);
