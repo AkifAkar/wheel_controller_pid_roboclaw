@@ -52,7 +52,7 @@ static bool g_has_connection = false;
 #define ROBOCLAW_UART_ID  uart1
 #define ROBOCLAW_TX_PIN   8
 #define ROBOCLAW_RX_PIN   9
-#define ROBOCLAW_BAUD     2400   
+#define ROBOCLAW_BAUD     57600  
 #define ROBOCLAW_ADDR     0x80
 #define ROBOCLAW_TIMEOUT  100000 
 
@@ -108,7 +108,7 @@ void update_encoder_target(int angle_input) {
     g_desired_encoder_val = ENC_MIN + ((angle_input - ANGLE_MIN) * possible_movement) / angle_range;
     
 }
-
+    
 void update_speed_target(int speed_input) {
     // Clamp to valid RoboClaw simple serial range (-127 to 127)
     if (speed_input > 127) speed_input = 127;
@@ -160,9 +160,9 @@ static int thread_motor_send(struct pt *pt) {
     static int32_t last_sent_target_m1 = (ENC_MIN+ENC_MAX)/2; 
     static int32_t last_sent_speed_m2 = 0; 
 
-    // Baud Rate Limiter (2400 baud = ~105ms per packet)
-    // We prevent sending faster than this to avoid blocking the CPU
-    const uint32_t MIN_TX_INTERVAL = 110; 
+    // Baud Rate Limiter (57600 baud = ~2ms per packet)
+    // Commands arrive at 10Hz (100ms), so 20ms interval safely handles them without spamming
+    const uint32_t MIN_TX_INTERVAL = 20; 
 
     PT_BEGIN(pt);
 
@@ -267,6 +267,8 @@ static int thread_udp_rx(struct pt *pt) {
     static uint8_t remote_ip[4];
     static uint16_t remote_port;
     static bool has_new_command;
+    static uint32_t last_command_time = 0;
+    static uint32_t timestamp = 0;
 
     PT_BEGIN(pt);
     while(1) {
@@ -288,9 +290,22 @@ static int thread_udp_rx(struct pt *pt) {
         if (has_new_command) {
             g_rx_buf[recv_len] = '\0';
             parse_and_process_json((char*)g_rx_buf);
+            last_command_time = to_ms_since_boot(get_absolute_time());
+        } else if (g_has_connection) {
+            // Watchdog: Stop the rover if no command received for 500ms
+            if (to_ms_since_boot(get_absolute_time()) - last_command_time > 500) {
+                if (g_desired_speed_val != 0) {
+                    g_desired_speed_val = 0;
+                    printf("[Watchdog] Connection lost! Stopping motors.\n");
+                }
+            }
         }
         
-        PT_YIELD(pt);
+        timestamp = to_ms_since_boot(get_absolute_time());
+        // Check for new packets every 10ms instead of unthrottled.
+        // Since commands come at 10Hz (100ms), 10ms polling is plenty fast 
+        // and stops us from spamming the Ethernet chip via SPI thousands of times a second.
+        PT_WAIT_UNTIL(pt, to_ms_since_boot(get_absolute_time()) - timestamp >= 10);
     }
     PT_END(pt);
 }
